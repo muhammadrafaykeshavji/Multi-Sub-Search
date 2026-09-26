@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -427,14 +428,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    url = f"http://127.0.0.1:{PORT}/"
-    print(f"Multi-Sub Search running at {url}", flush=True)
+    port = int(os.environ.get("PORT", str(PORT)))
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    url = f"http://127.0.0.1:{port}/"
+    print(f"Multi-Sub Search running at {url} (listening on 0.0.0.0:{port})", flush=True)
     print("Keep this window open. Ctrl+C to stop.", flush=True)
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
+    if os.environ.get("PORT") is None:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
