@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Multi-Sub Reddit Search</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#1a1d24; --border:#2a2e38; --text:#e8e8ea;
+    --muted:#9199a8; --accent:#ff6a3d; --accent2:#4fa3ff;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#f5f6f8; --panel:#ffffff; --border:#dde1e6; --text:#1a1d24; --muted:#666d7a;
+    }
+  }
+  *{box-sizing:border-box;}
+  html{scroll-padding-top:env(safe-area-inset-top,0px);}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    padding-top:env(safe-area-inset-top,0px);
+    padding-bottom:env(safe-area-inset-bottom,0px);
+    min-height:100%;
+  }
+  .wrap{max-width:820px;margin:0 auto;padding:20px 16px 60px;}
+  h1{font-size:1.3rem;margin:0 0 4px;}
+  p.sub{color:var(--muted);margin:0 0 20px;font-size:.9rem;}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px;}
+  label{display:block;font-size:.8rem;color:var(--muted);margin-bottom:4px;font-weight:600;}
+  input[type=text]{
+    width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--border);
+    background:var(--bg);color:var(--text);font-size:.95rem;margin-bottom:12px;
+  }
+  .row{display:flex;gap:10px;flex-wrap:wrap;}
+  .row > div{flex:1;min-width:200px;}
+  select{
+    width:100%;padding:10px;border-radius:8px;border:1px solid var(--border);
+    background:var(--bg);color:var(--text);font-size:.9rem;
+  }
+  button{
+    background:var(--accent);color:#fff;border:none;border-radius:8px;
+    padding:11px 20px;font-size:.95rem;font-weight:600;cursor:pointer;width:100%;
+  }
+  button:disabled{opacity:.5;cursor:default;}
+  .results{margin-top:10px;}
+  .sub-group{margin-bottom:18px;}
+  .sub-group h3{
+    font-size:.9rem;color:var(--accent2);margin:0 0 8px;
+    display:flex;justify-content:space-between;align-items:center;
+  }
+  .post{
+    display:block;padding:10px 12px;border:1px solid var(--border);border-radius:8px;
+    margin-bottom:6px;text-decoration:none;color:var(--text);background:var(--bg);
+  }
+  .post:hover{border-color:var(--accent);}
+  .post .meta{font-size:.72rem;color:var(--muted);margin-top:4px;}
+  .status{color:var(--muted);font-size:.85rem;padding:8px 0;}
+  .error{color:#ff6a3d;font-size:.82rem;}
+  .empty{color:var(--muted);font-size:.85rem;font-style:italic;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Multi-Sub Reddit Search</h1>
+  <p class="sub">Search one keyword across several subreddits at once. Double-click <code>Start Multi-Sub Search.bat</code> (or run <code>multi-sub-search-server.py</code>) and use <a href="http://127.0.0.1:8765/" style="color:var(--accent2);">http://127.0.0.1:8765/</a> — opening the HTML file alone often fails because Reddit blocks public CORS proxies.</p>
+
+  <div class="panel">
+    <label for="term">Search term</label>
+    <input type="text" id="term" value="shia" placeholder="e.g. shia">
+
+    <label for="subs">Subreddits (comma separated, no r/)</label>
+    <input type="text" id="subs" value="atheism, DebateReligion, exmuslim" placeholder="e.g. atheism, exmuslim">
+
+    <div class="row">
+      <div>
+        <label for="sort">Sort</label>
+        <select id="sort">
+          <option value="new">New</option>
+          <option value="relevance">Relevance</option>
+          <option value="top">Top</option>
+          <option value="comments">Most comments</option>
+        </select>
+      </div>
+      <div>
+        <label for="limit">Results per sub</label>
+        <select id="limit">
+          <option value="10">10</option>
+          <option value="25" selected>25</option>
+          <option value="50">50</option>
+        </select>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;">
+      <button id="go">Search all</button>
+    </div>
+  </div>
+
+  <div id="results" class="results"></div>
+</div>
+
+<script>
+const goBtn = document.getElementById('go');
+const resultsEl = document.getElementById('results');
+
+goBtn.addEventListener('click', runSearch);
+document.getElementById('term').addEventListener('keydown', e => { if(e.key==='Enter') runSearch(); });
+
+async function fetchJson(url, timeoutMs){
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs || 15000) });
+  if(!res.ok) throw new Error('HTTP ' + res.status);
+  let data = await res.json();
+  if(data && typeof data.contents === 'string'){
+    data = JSON.parse(data.contents);
+  }
+  return data;
+}
+
+/** Prefer local helper; then PullPush (browser CORS); then flaky public proxies */
+async function fetchSubSearch(sub, term, sort, limit){
+  const errors = [];
+
+  // 1) Local Python helper (multi-sub-search-server.py)
+  if(location.protocol === 'http:' || location.protocol === 'https:'){
+    try{
+      const local = `${location.origin}/reddit?sub=${encodeURIComponent(sub)}&q=${encodeURIComponent(term)}&sort=${encodeURIComponent(sort)}&limit=${encodeURIComponent(limit)}`;
+      const data = await fetchJson(local, 45000);
+      const posts = normalizeRedditListing(data);
+      if(posts) return posts;
+      throw new Error('Unexpected local response');
+    }catch(err){
+      errors.push('local: ' + (err.message || String(err)));
+    }
+  }
+
+  // 2) PullPush — often allows browser CORS when Reddit/proxies fail
+  try{
+    const sortType = ({ new:'created_utc', top:'score', comments:'num_comments', relevance:'score' })[sort] || 'created_utc';
+    const pp = `https://api.pullpush.io/reddit/search/submission/?q=${encodeURIComponent(term)}&subreddit=${encodeURIComponent(sub)}&size=${encodeURIComponent(limit)}&sort=desc&sort_type=${sortType}`;
+    const data = await fetchJson(pp, 25000);
+    const rows = Array.isArray(data.data) ? data.data : (Array.isArray(data) ? data : []);
+    return rows.map(d => ({
+      title: d.title || '',
+      author: d.author || '[deleted]',
+      permalink: d.permalink || (d.id ? `/comments/${d.id}/` : '#'),
+      created_utc: d.created_utc || 0,
+      selftext: d.selftext || '',
+      num_comments: d.num_comments || 0,
+      score: d.score || 0
+    }));
+  }catch(err){
+    errors.push('pullpush: ' + (err.message || String(err)));
+  }
+
+  // 3) Public CORS proxies around Reddit JSON (frequently 520 / blocked)
+  const redditUrls = [
+    `https://old.reddit.com/r/${encodeURIComponent(sub)}/search.json?q=${encodeURIComponent(term)}&restrict_sr=1&sort=${sort}&limit=${limit}&raw_json=1`,
+    `https://www.reddit.com/r/${encodeURIComponent(sub)}/search.json?q=${encodeURIComponent(term)}&restrict_sr=1&sort=${sort}&limit=${limit}&raw_json=1`
+  ];
+  const proxies = [
+    url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+    url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+  ];
+  for(const targetUrl of redditUrls){
+    for(const build of proxies){
+      try{
+        const data = await fetchJson(build(targetUrl), 15000);
+        const posts = normalizeRedditListing(data);
+        if(posts) return posts;
+        throw new Error('Unexpected response shape');
+      }catch(err){
+        errors.push(err.message || String(err));
+      }
+    }
+  }
+
+  throw new Error(errors.slice(-3).join(' · ') || 'All sources failed');
+}
+
+function normalizeRedditListing(data){
+  const children = data && data.data && data.data.children;
+  if(!Array.isArray(children)) return null;
+  return children.map(p => {
+    const d = p.data || {};
+    return {
+      title: d.title || '',
+      author: d.author || '[deleted]',
+      permalink: d.permalink || '#',
+      created_utc: d.created_utc || 0,
+      selftext: d.selftext || '',
+      num_comments: d.num_comments || 0,
+      score: d.score || 0
+    };
+  });
+}
+
+function renderPosts(groupEl, posts){
+  const statusSpan = groupEl.querySelector('.status');
+  statusSpan.textContent = posts.length + ' result' + (posts.length === 1 ? '' : 's');
+
+  if(posts.length === 0){
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No matches.';
+    groupEl.appendChild(empty);
+    return;
+  }
+
+  posts.forEach(d => {
+    const link = document.createElement('a');
+    link.className = 'post';
+    const path = d.permalink.startsWith('http') ? d.permalink : ('https://www.reddit.com' + d.permalink);
+    link.href = path;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    const date = d.created_utc ? new Date(d.created_utc * 1000).toLocaleDateString() : '';
+    const snippet = (d.selftext || '').slice(0, 180);
+    link.innerHTML = `${escapeHtml(d.title)}${snippet ? '<div class="meta" style="margin-top:6px;">' + escapeHtml(snippet) + (d.selftext.length > 180 ? '...' : '') + '</div>' : ''}<div class="meta">u/${escapeHtml(d.author)} · ${date} · ${d.num_comments} comments · score ${d.score}</div>`;
+    groupEl.appendChild(link);
+  });
+}
+
+async function runSearch(){
+  const term = document.getElementById('term').value.trim();
+  const subsRaw = document.getElementById('subs').value.trim();
+  const sort = document.getElementById('sort').value;
+  const limit = document.getElementById('limit').value;
+
+  if(!term || !subsRaw){
+    resultsEl.innerHTML = '<div class="error">Enter a search term and at least one subreddit.</div>';
+    return;
+  }
+
+  const subs = subsRaw.split(',').map(s => s.trim().replace(/^r\//i, '')).filter(Boolean);
+
+  goBtn.disabled = true;
+  goBtn.textContent = 'Searching...';
+  resultsEl.innerHTML = '';
+
+  for(const sub of subs){
+    const groupEl = document.createElement('div');
+    groupEl.className = 'sub-group';
+    groupEl.innerHTML = `<h3>r/${escapeHtml(sub)} <span class="status">loading...</span></h3>`;
+    resultsEl.appendChild(groupEl);
+
+    try{
+      const posts = await fetchSubSearch(sub, term, sort, limit);
+      renderPosts(groupEl, posts);
+    }catch(err){
+      const statusSpan = groupEl.querySelector('.status');
+      statusSpan.textContent = '';
+      const errEl = document.createElement('div');
+      errEl.className = 'error';
+      const fallbackUrl = `https://www.reddit.com/r/${encodeURIComponent(sub)}/search/?q=${encodeURIComponent(term)}&restrict_sr=1&sort=${sort}`;
+      errEl.innerHTML = `Couldn't fetch (${escapeHtml(err.message)}). <a href="${fallbackUrl}" target="_blank" style="color:var(--accent2);">Open manually &rarr;</a>`;
+      groupEl.appendChild(errEl);
+    }
+  }
+
+  goBtn.disabled = false;
+  goBtn.textContent = 'Search all';
+}
+
+function escapeHtml(str){
+  return String(str).replace(/[&<>"']/g, m => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[m]));
+}
+</script>
+</body>
+</html>
