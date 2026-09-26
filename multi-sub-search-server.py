@@ -2,9 +2,11 @@
 """Serve multi-sub-search.html and proxy search (Reddit blocks bare scrapers)."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,40 +17,53 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 HTML = ROOT / "multi-sub-search.html"
 PORT = 8765
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+UA = os.environ.get(
+    "REDDIT_USER_AGENT",
+    "windows:multi-sub-search:1.1.0 (by /u/MultiSubSearchBot)",
+).strip() or "windows:multi-sub-search:1.1.0 (by /u/MultiSubSearchBot)"
+
+_oauth_token: str | None = None
+_oauth_expires_at = 0.0
 
 
-def _get(url: str, timeout: int = 25, accept: str = "application/json,text/plain,*/*") -> bytes:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": UA,
-            "Accept": accept,
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
+def _get(
+    url: str,
+    timeout: int = 25,
+    accept: str = "application/json,text/plain,*/*",
+    headers: dict | None = None,
+) -> bytes:
+    hdrs = {
+        "User-Agent": UA,
+        "Accept": accept,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
     with urllib.request.urlopen(req, timeout=timeout) as res:
         return res.read()
 
 
-def _post(url: str, form: dict, timeout: int = 25) -> bytes:
+def _post(
+    url: str,
+    form: dict,
+    timeout: int = 25,
+    headers: dict | None = None,
+    basic_auth: tuple[str, str] | None = None,
+) -> bytes:
     data = urllib.parse.urlencode(form).encode()
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": "https://duckduckgo.com/",
-        },
-        method="POST",
-    )
+    hdrs = {
+        "User-Agent": UA,
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    if headers:
+        hdrs.update(headers)
+    if basic_auth:
+        token = base64.b64encode(f"{basic_auth[0]}:{basic_auth[1]}".encode()).decode()
+        hdrs["Authorization"] = f"Basic {token}"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as res:
         return res.read()
 
@@ -93,13 +108,73 @@ def _listing_from_rows(rows) -> bytes:
     return json.dumps({"kind": "Listing", "data": {"children": children}}).encode()
 
 
+def html_unescape(s: str) -> str:
+    return (
+        s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#x2F;", "/")
+        .replace("%2F", "/")
+    )
+
+
+def _oauth_configured() -> bool:
+    return bool(os.environ.get("REDDIT_CLIENT_ID", "").strip())
+
+
+def _get_oauth_token() -> str:
+    """Application-only OAuth — works from cloud IPs when credentials are set."""
+    global _oauth_token, _oauth_expires_at
+    if _oauth_token and time.time() < _oauth_expires_at - 60:
+        return _oauth_token
+
+    client_id = os.environ.get("REDDIT_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
+    if not client_id:
+        raise RuntimeError("REDDIT_CLIENT_ID not set")
+
+    raw = _post(
+        "https://www.reddit.com/api/v1/access_token",
+        {"grant_type": "client_credentials"},
+        timeout=20,
+        basic_auth=(client_id, client_secret),
+    )
+    data = json.loads(raw)
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError(f"OAuth failed: {data}")
+    _oauth_token = token
+    _oauth_expires_at = time.time() + float(data.get("expires_in") or 3600)
+    return token
+
+
+def _search_oauth(sub: str, q: str, sort: str, limit: int) -> bytes:
+    token = _get_oauth_token()
+    params = urllib.parse.urlencode(
+        {
+            "q": q,
+            "restrict_sr": "true",
+            "sort": sort,
+            "limit": str(limit),
+            "raw_json": "1",
+            "type": "link",
+        }
+    )
+    url = f"https://oauth.reddit.com/r/{urllib.parse.quote(sub)}/search?{params}"
+    body = _get(
+        url,
+        timeout=25,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return _as_reddit_listing(body)
+
+
 def _parse_ddg_html(html: str, sub: str, limit: int) -> bytes:
     blocks = re.findall(
         r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
         html,
         flags=re.I | re.S,
     )
-    # lite layout sometimes uses different anchors
     if not blocks:
         blocks = re.findall(
             r'href="([^"]*uddg=[^"]+)"[^>]*>(.*?)</a>',
@@ -162,12 +237,11 @@ def _search_web_html(sub: str, q: str, limit: int) -> bytes:
     for base, mode in engines:
         try:
             if mode == "post":
-                html = _post(base, {"q": query}, timeout=30).decode("utf-8", "replace")
+                html = _post(base, {"q": query}, timeout=18).decode("utf-8", "replace")
             else:
                 url = base + urllib.parse.urlencode({"q": query})
-                html = _get(url, timeout=30, accept=accept_html).decode("utf-8", "replace")
+                html = _get(url, timeout=18, accept=accept_html).decode("utf-8", "replace")
 
-            # Collect candidate reddit URLs (direct + DDG uddg wrappers)
             hrefs = re.findall(r'href="([^"]+)"', html, flags=re.I)
             rows = []
             seen = set()
@@ -187,12 +261,10 @@ def _search_web_html(sub: str, q: str, limit: int) -> bytes:
                     continue
                 if "/comments/" not in path.lower():
                     continue
-                # dedupe by post id when possible
                 key = path.lower()
                 if key in seen:
                     continue
                 seen.add(key)
-                # title: nearby text is hard; use last path segment
                 slug = path.rstrip("/").split("/")[-1].replace("_", " ")
                 rows.append(
                     {
@@ -208,7 +280,6 @@ def _search_web_html(sub: str, q: str, limit: int) -> bytes:
                 if len(rows) >= limit:
                     break
 
-            # Prefer DDG-style titled anchors when present
             titled = None
             try:
                 if "result__a" in html or "uddg=" in html:
@@ -226,16 +297,6 @@ def _search_web_html(sub: str, q: str, limit: int) -> bytes:
     raise RuntimeError(" | ".join(errors[-3:]) or "web search failed")
 
 
-def html_unescape(s: str) -> str:
-    return (
-        s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&#x2F;", "/")
-        .replace("%2F", "/")
-    )
-
-
 def _search_searx(sub: str, q: str, limit: int) -> bytes:
     query = f"site:reddit.com/r/{sub} {q}"
     instances = [
@@ -248,7 +309,7 @@ def _search_searx(sub: str, q: str, limit: int) -> bytes:
     for base in instances:
         url = base + "?" + urllib.parse.urlencode({"q": query, "format": "json"})
         try:
-            raw = _get(url, timeout=25)
+            raw = _get(url, timeout=15)
             if not raw.lstrip().startswith(b"{"):
                 raise RuntimeError("Searx returned non-JSON")
             data = json.loads(raw)
@@ -287,6 +348,34 @@ def _search_searx(sub: str, q: str, limit: int) -> bytes:
     raise last_err or RuntimeError("Searx failed")
 
 
+def _search_redlib(sub: str, q: str, sort: str, limit: int) -> bytes:
+    """Public Redlib/Libreddit frontends sometimes expose Reddit JSON."""
+    sort_map = {"new": "new", "top": "top", "comments": "comments", "relevance": "relevance"}
+    rsort = sort_map.get(sort, "new")
+    hosts = [
+        "https://redlib.perennialte.ch",
+        "https://libreddit.projectsegfau.lt",
+        "https://redlib.privacyredirect.com",
+        "https://safereddit.com",
+    ]
+    params = urllib.parse.urlencode(
+        {"q": q, "restrict_sr": "on", "sort": rsort, "type": "link"}
+    )
+    errors = []
+    for host in hosts:
+        url = f"{host}/r/{urllib.parse.quote(sub)}/search.json?{params}"
+        try:
+            body = _get(url, timeout=12)
+            listing = _as_reddit_listing(body)
+            children = json.loads(listing)["data"]["children"][:limit]
+            return json.dumps(
+                {"kind": "Listing", "data": {"children": children}}
+            ).encode()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{host}: {e}")
+    raise RuntimeError(" | ".join(errors[-2:]) or "redlib failed")
+
+
 def fetch_reddit_listing(sub: str, q: str, sort: str, limit: str) -> bytes:
     sort_type = {
         "new": "created_utc",
@@ -300,19 +389,32 @@ def fetch_reddit_listing(sub: str, q: str, sort: str, limit: str) -> bytes:
         lim = 25
     errors: list[str] = []
 
-    # 1) Public web search HTML (DDG / Brave / Mojeek / Bing)
+    # 0) Official Reddit OAuth — best for Render / cloud IPs
+    if _oauth_configured():
+        try:
+            return _search_oauth(sub, q, sort, lim)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"oauth: {e}")
+
+    # 1) Redlib / Libreddit mirrors
+    try:
+        return _search_redlib(sub, q, sort, lim)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"redlib: {e}")
+
+    # 2) Public web search HTML (DDG / Brave / Mojeek / Bing)
     try:
         return _search_web_html(sub, q, lim)
     except Exception as e:  # noqa: BLE001
         errors.append(f"web: {e}")
 
-    # 2) Public Searx JSON instances
+    # 3) Public Searx JSON instances
     try:
         return _search_searx(sub, q, lim)
     except Exception as e:  # noqa: BLE001
         errors.append(f"searx: {e}")
 
-    # 3) PullPush mirror
+    # 4) PullPush mirror
     pp = (
         "https://api.pullpush.io/reddit/search/submission/?"
         + urllib.parse.urlencode(
@@ -326,7 +428,7 @@ def fetch_reddit_listing(sub: str, q: str, sort: str, limit: str) -> bytes:
         )
     )
     try:
-        raw = json.loads(_get(pp, timeout=30))
+        raw = json.loads(_get(pp, timeout=20))
         rows = raw.get("data") if isinstance(raw, dict) else raw
         listing = _listing_from_rows(rows)
         if json.loads(listing)["data"]["children"]:
@@ -335,7 +437,7 @@ def fetch_reddit_listing(sub: str, q: str, sort: str, limit: str) -> bytes:
     except Exception as e:  # noqa: BLE001
         errors.append(f"pullpush: {e}")
 
-    # 4) Arctic Shift archive
+    # 5) Arctic Shift archive
     arctic = (
         "https://arctic-shift.photon-reddit.com/api/posts/search?"
         + urllib.parse.urlencode(
@@ -349,7 +451,7 @@ def fetch_reddit_listing(sub: str, q: str, sort: str, limit: str) -> bytes:
         )
     )
     try:
-        raw = json.loads(_get(arctic, timeout=45))
+        raw = json.loads(_get(arctic, timeout=25))
         rows = raw.get("data") if isinstance(raw, dict) else raw
         listing = _listing_from_rows(rows)
         if json.loads(listing)["data"]["children"]:
@@ -358,18 +460,24 @@ def fetch_reddit_listing(sub: str, q: str, sort: str, limit: str) -> bytes:
     except Exception as e:  # noqa: BLE001
         errors.append(f"arctic: {e}")
 
-    # 5) Direct Reddit JSON (works on some networks)
+    # 6) Direct Reddit JSON (often blocked on cloud)
     params = urllib.parse.urlencode(
         {"q": q, "restrict_sr": "1", "sort": sort, "limit": str(lim), "raw_json": "1"}
     )
     for host in ("www.reddit.com", "old.reddit.com"):
         url = f"https://{host}/r/{urllib.parse.quote(sub)}/search.json?{params}"
         try:
-            return _as_reddit_listing(_get(url))
+            return _as_reddit_listing(_get(url, timeout=15))
         except Exception as e:  # noqa: BLE001
             errors.append(f"{host}: {e}")
 
-    raise RuntimeError(" · ".join(errors[-4:]) or "fetch failed")
+    hint = ""
+    if not _oauth_configured():
+        hint = (
+            " | Tip: set REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET on Render "
+            "(free app at https://www.reddit.com/prefs/apps )"
+        )
+    raise RuntimeError((" · ".join(errors[-4:]) or "fetch failed") + hint)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -398,9 +506,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/", "/index.html", "/multi-sub-search.html"):
             if not HTML.exists():
-                self._send(404, b"multi-sub-search.html not found next to this script", "text/plain")
+                self._send(
+                    404,
+                    b"multi-sub-search.html not found next to this script",
+                    "text/plain",
+                )
                 return
             self._send(200, HTML.read_bytes(), "text/html; charset=utf-8")
+            return
+
+        if path == "/health":
+            info = {
+                "ok": True,
+                "oauth_configured": _oauth_configured(),
+            }
+            self._send(200, json.dumps(info).encode(), "application/json")
             return
 
         if path == "/reddit":
@@ -431,7 +551,16 @@ def main() -> None:
     port = int(os.environ.get("PORT", str(PORT)))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     url = f"http://127.0.0.1:{port}/"
-    print(f"Multi-Sub Search running at {url} (listening on 0.0.0.0:{port})", flush=True)
+    print(f"Multi-Sub Search listening on 0.0.0.0:{port}", flush=True)
+    print(f"Local URL: {url}", flush=True)
+    if _oauth_configured():
+        print("Reddit OAuth: configured (REDDIT_CLIENT_ID set)", flush=True)
+    else:
+        print(
+            "Reddit OAuth: NOT set — for Render, add REDDIT_CLIENT_ID + "
+            "REDDIT_CLIENT_SECRET (create free app at reddit.com/prefs/apps)",
+            flush=True,
+        )
     print("Keep this window open. Ctrl+C to stop.", flush=True)
     if os.environ.get("PORT") is None:
         try:

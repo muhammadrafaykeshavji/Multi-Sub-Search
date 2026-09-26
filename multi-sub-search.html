@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Multi-Sub Reddit Search</h1>
-  <p class="sub">Search one keyword across several subreddits at once. Double-click <code>Start Multi-Sub Search.bat</code> (or run <code>multi-sub-search-server.py</code>) and use <a href="http://127.0.0.1:8765/" style="color:var(--accent2);">http://127.0.0.1:8765/</a> — opening the HTML file alone often fails because Reddit blocks public CORS proxies.</p>
+  <p class="sub">Search one keyword across several subreddits at once. Live: open this page’s own URL (e.g. your Render link). Locally: run <code>Start Multi-Sub Search.bat</code> and use <a href="http://127.0.0.1:8765/" style="color:var(--accent2);">http://127.0.0.1:8765/</a>.</p>
 
   <div class="panel">
     <label for="term">Search term</label>
@@ -125,7 +125,7 @@ async function fetchSubSearch(sub, term, sort, limit){
   if(location.protocol === 'http:' || location.protocol === 'https:'){
     try{
       const local = `${location.origin}/reddit?sub=${encodeURIComponent(sub)}&q=${encodeURIComponent(term)}&sort=${encodeURIComponent(sort)}&limit=${encodeURIComponent(limit)}`;
-      const data = await fetchJson(local, 45000);
+      const data = await fetchJson(local, 90000);
       const posts = normalizeRedditListing(data);
       if(posts) return posts;
       throw new Error('Unexpected local response');
@@ -239,7 +239,7 @@ async function runSearch(){
   goBtn.textContent = 'Searching...';
   resultsEl.innerHTML = '';
 
-  for(const sub of subs){
+  await Promise.all(subs.map(async (sub) => {
     const groupEl = document.createElement('div');
     groupEl.className = 'sub-group';
     groupEl.innerHTML = `<h3>r/${escapeHtml(sub)} <span class="status">loading...</span></h3>`;
@@ -257,7 +257,7 @@ async function runSearch(){
       errEl.innerHTML = `Couldn't fetch (${escapeHtml(err.message)}). <a href="${fallbackUrl}" target="_blank" style="color:var(--accent2);">Open manually &rarr;</a>`;
       groupEl.appendChild(errEl);
     }
-  }
+  }));
 
   goBtn.disabled = false;
   goBtn.textContent = 'Search all';
